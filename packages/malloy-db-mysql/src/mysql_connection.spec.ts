@@ -6,6 +6,7 @@
 import {MySQLConnection, MySQLExecutor} from '.';
 import {createTestRuntime, mkTestModel} from '@malloydata/malloy/test';
 import '@malloydata/malloy/test/matchers';
+import crypto from 'crypto';
 
 const config = MySQLExecutor.getConnectionOptionsFromEnv();
 const hasCredentials = !!config.user;
@@ -226,5 +227,189 @@ describeMySQL('numeric value reading', () => {
         ).toMatchResult(testModel, {f: 10.5});
       }
     );
+  });
+});
+
+describeMySQL('session lifecycle', () => {
+  const admin = new MySQLConnection('mysql_lifecycle_admin', config);
+  // The users created below need a database to be granted on and to connect
+  // to; CI names the fixture database in MYSQL_DATABASE.
+  const database = config.database ?? 'malloytest';
+  const users: string[] = [];
+  const connections: MySQLConnection[] = [];
+
+  const track = (connection: MySQLConnection) => {
+    connections.push(connection);
+    return connection;
+  };
+
+  function numberIn(
+    row: {[column: string]: unknown} | undefined,
+    column: string,
+    sql: string
+  ): number {
+    const value = row?.[column];
+    if (typeof value !== 'number') {
+      throw new Error(
+        `Expected a numeric ${column}, got ${JSON.stringify(row)} from: ${sql}`
+      );
+    }
+    return value;
+  }
+
+  async function adminCount(sql: string): Promise<number> {
+    const {rows} = await admin.runRawSQL(sql);
+    return numberIn(rows[0], 'n', sql);
+  }
+
+  async function connectionId(connection: MySQLConnection): Promise<number> {
+    const sql = 'SELECT CONNECTION_ID() AS id';
+    const {rows} = await connection.runSQL(sql);
+    return numberIn(rows[0], 'id', sql);
+  }
+
+  // The server takes an ended session off the processlist asynchronously,
+  // so poll for the count to reach zero rather than reading it once.
+  async function settledCount(sql: string, timeoutMs = 5000): Promise<number> {
+    const deadline = Date.now() + timeoutMs;
+    let n = await adminCount(sql);
+    while (n > 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+      n = await adminCount(sql);
+    }
+    return n;
+  }
+
+  const sessionsWithId = (id: number) =>
+    `SELECT COUNT(*) AS n FROM performance_schema.processlist WHERE ID = ${id}`;
+  const sessionsOf = (user: string) =>
+    `SELECT COUNT(*) AS n FROM performance_schema.processlist WHERE USER = '${user}'`;
+
+  // A user of its own lets the server's views attribute sessions, temporary
+  // tables and statement totals to one MySQLConnection, whatever else is
+  // running against the same server.
+  async function connectAsNewUser(privileges: string) {
+    const user = `malloy_test_${crypto.randomBytes(4).toString('hex')}`;
+    const password = crypto.randomBytes(16).toString('hex');
+    await admin.runRawSQL(
+      `CREATE USER '${user}'@'%' IDENTIFIED BY '${password}'`
+    );
+    users.push(user);
+    await admin.runRawSQL(
+      `GRANT ${privileges} ON \`${database}\`.* TO '${user}'@'%'`
+    );
+    const connection = track(
+      new MySQLConnection('mysql', {...config, user, password, database})
+    );
+    return {connection, user};
+  }
+
+  async function killSessionsOf(user: string) {
+    const list = `SELECT ID AS id FROM performance_schema.processlist WHERE USER = '${user}'`;
+    const {rows} = await admin.runRawSQL(list);
+    for (const row of rows) {
+      try {
+        await admin.runRawSQL(`KILL ${numberIn(row, 'id', list)}`);
+      } catch (e) {
+        // The session can end on its own between the listing and the KILL.
+        if (!(e instanceof Error && e.message.includes('Unknown thread id'))) {
+          throw e;
+        }
+      }
+    }
+  }
+
+  afterAll(async () => {
+    await Promise.all(connections.map(c => c.close()));
+    for (const user of users) {
+      await killSessionsOf(user);
+      await admin.runRawSQL(`DROP USER IF EXISTS '${user}'@'%'`);
+    }
+    await admin.close();
+  });
+
+  it('answers a query after the server kills its session', async () => {
+    const connection = track(new MySQLConnection('mysql', config));
+    const killed = await connectionId(connection);
+    await admin.runRawSQL(`KILL ${killed}`);
+    // KILL returns before the session has ended. Once it has, the next query
+    // cannot be answered by it.
+    expect(await settledCount(sessionsWithId(killed))).toBe(0);
+    expect(await connectionId(connection)).not.toBe(killed);
+  });
+
+  it('answers a query after the server closes its idle session', async () => {
+    const connection = track(
+      new MySQLConnection('mysql', {
+        ...config,
+        setupSQL: 'SET SESSION wait_timeout = 1',
+      })
+    );
+    const closed = await connectionId(connection);
+    // The deadline covers the second of idleness the server waits out first.
+    expect(await settledCount(sessionsWithId(closed), 10000)).toBe(0);
+    expect(await connectionId(connection)).not.toBe(closed);
+  });
+
+  it('leaves no session open after close() when first used concurrently', async () => {
+    const {connection, user} = await connectAsNewUser('SELECT');
+    await Promise.all(
+      Array.from({length: 5}, () => connection.runSQL('SELECT 1 AS one'))
+    );
+    await connection.close();
+    expect(await settledCount(sessionsOf(user))).toBe(0);
+  });
+
+  describe('fetchSelectSchema', () => {
+    const digits = Array.from({length: 10}, (_, d) => `SELECT ${d} AS d`).join(
+      ' UNION ALL '
+    );
+    const thousandRows = `SELECT a.d * 100 + b.d * 10 + c.d AS n FROM (${digits}) a CROSS JOIN (${digits}) b CROSS JOIN (${digits}) c`;
+
+    it("writes none of the query's rows to read its schema", async () => {
+      const {connection, user} = await connectAsNewUser(
+        'SELECT, CREATE TEMPORARY TABLES'
+      );
+      const schema = await connection.fetchSelectSchema({
+        connection: 'mysql',
+        selectStr: thousandRows,
+      });
+      expect(schema.fields.map(f => f.name)).toEqual(['n']);
+      // performance_schema totals each user's statements, rows stored into a
+      // temporary table included, across every session the user opened.
+      const totals = `SELECT CAST(SUM(COUNT_STAR) AS SIGNED) AS statements, CAST(SUM(SUM_ROWS_AFFECTED) AS SIGNED) AS rows_written FROM performance_schema.events_statements_summary_by_user_by_event_name WHERE USER = '${user}'`;
+      const {rows} = await admin.runRawSQL(totals);
+      // A zero for rows written is a measurement only if the user's
+      // statements were recorded at all.
+      expect(numberIn(rows[0], 'statements', totals)).toBeGreaterThan(0);
+      expect(numberIn(rows[0], 'rows_written', totals)).toBe(0);
+    });
+
+    it('leaves no temporary table behind on its session', async () => {
+      const {connection, user} = await connectAsNewUser(
+        'SELECT, CREATE TEMPORARY TABLES'
+      );
+      const temporaryTables = `SELECT COUNT(*) AS n FROM information_schema.INNODB_TEMP_TABLE_INFO t JOIN information_schema.INNODB_SESSION_TEMP_TABLESPACES s ON t.SPACE = s.SPACE JOIN performance_schema.processlist p ON p.ID = s.ID WHERE p.USER = '${user}'`;
+      // A table the test made itself shows the count can see this user's
+      // temporary tables, so an unchanged count is not an empty view.
+      await connection.runSQL('CREATE TEMPORARY TABLE witness (x INT)');
+      expect(await adminCount(temporaryTables)).toBe(1);
+      await connection.fetchSelectSchema({
+        connection: 'mysql',
+        selectStr: thousandRows,
+      });
+      expect(await adminCount(temporaryTables)).toBe(1);
+    });
+
+    it("reads a query's schema as a user who may only SELECT", async () => {
+      const {connection} = await connectAsNewUser('SELECT');
+      const selectStr = 'SELECT 1 AS one';
+      expect((await connection.runSQL(selectStr)).rows).toEqual([{one: 1}]);
+      const schema = await connection.fetchSelectSchema({
+        connection: 'mysql',
+        selectStr,
+      });
+      expect(schema.fields).toMatchObject([{name: 'one', type: 'number'}]);
+    });
   });
 });

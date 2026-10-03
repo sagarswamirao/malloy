@@ -47,4 +47,23 @@ describeMySQL('setupSQL', () => {
     const result = await conn.runSQL(`SELECT ${varName} AS v`);
     expect(result.rows[0]['v']).toBe(99);
   });
+
+  // The middle statement fails on every attempt, so no session can ever be
+  // fully set up, and every query has to fail, not just the first.
+  it('rejects every query while a setup statement keeps failing', async () => {
+    const before = `@setup_before_${uid}`;
+    const after = `@setup_after_${uid}`;
+    const missing = `setup_missing_${uid}`;
+    const conn = makeConn(
+      'mysql',
+      [
+        `SET ${before} = 'applied'`,
+        `SELECT * FROM ${missing}`,
+        `SET ${after} = 'applied'`,
+      ].join(';\n')
+    );
+    const probe = `SELECT ${before} AS before_value, ${after} AS after_value`;
+    await expect(conn.runSQL(probe)).rejects.toThrow(missing);
+    await expect(conn.runSQL(probe)).rejects.toThrow(missing);
+  });
 });
