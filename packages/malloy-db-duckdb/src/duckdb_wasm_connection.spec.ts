@@ -3,11 +3,13 @@
  * SPDX-License-Identifier: MIT
  */
 
+import {getEventListeners} from 'events';
+import type {AsyncDuckDB} from '@duckdb/duckdb-wasm';
 import {wrapTestModel} from '@malloydata/malloy/test';
 import '@malloydata/malloy/test/matchers';
 import {DuckDBCommon} from './duckdb_common';
 import {DuckDBWASMConnection} from './duckdb_wasm_connection_node';
-import type {SQLSourceDef} from '@malloydata/malloy';
+import type {QueryRecord, SQLSourceDef} from '@malloydata/malloy';
 import * as malloy from '@malloydata/malloy';
 
 describe('DuckDBWasmConnection', () => {
@@ -146,6 +148,188 @@ FROM read_parquet("inventory_items2.parquet")
     const result = await connection.runSQL("SELECT DATE '2024-01-15' AS d");
     expect(result.rows[0]['d']).toBeInstanceOf(Date);
     expect((result.rows[0]['d'] as Date).toISOString()).toContain('2024-01-15');
+  });
+});
+
+describe('runSQLStream cleanup', () => {
+  // Two million rows arrive as several hundred result batches, so a stream
+  // that keeps reading after its row limit shows up as hundreds of fetches.
+  const MANY_BATCHES = 'SELECT range AS i, range * 2 AS j FROM range(2000000)';
+  // Runs far longer than the slice of work the worker does before answering
+  // startPendingQuery, so send() has to poll for it and it is pending when
+  // the abort lands.
+  const SLOW_QUERY =
+    'SELECT max(a.range + b.range) AS m FROM range(30000) a, range(30000) b';
+
+  let connection: DuckDBWASMConnection;
+
+  beforeAll(async () => {
+    connection = new DuckDBWASMConnection('duckdb');
+    await connection.runSQL('SELECT 1');
+  });
+
+  afterAll(async () => {
+    await connection.close();
+  });
+
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  function openDatabase(): AsyncDuckDB {
+    const db = connection.database;
+    if (db === null) {
+      throw new Error(`expected an open duckdb-wasm database, got ${db}`);
+    }
+    return db;
+  }
+
+  async function readAll(
+    stream: AsyncIterable<QueryRecord>
+  ): Promise<QueryRecord[]> {
+    const rows: QueryRecord[] = [];
+    for await (const row of stream) {
+      rows.push(row);
+    }
+    return rows;
+  }
+
+  function abortListenerCount(signal: AbortSignal): number {
+    return getEventListeners(signal, 'abort').length;
+  }
+
+  it('stops fetching result batches once rowLimit rows have been read', async () => {
+    const fetches = jest.spyOn(openDatabase(), 'fetchQueryResults');
+
+    const consumerRows: QueryRecord[] = [];
+    for await (const row of connection.runSQLStream(MANY_BATCHES, {
+      rowLimit: 2000000,
+    })) {
+      consumerRows.push(row);
+      if (consumerRows.length === 10) {
+        break;
+      }
+    }
+    // A consumer that stops itself after the same rows fetches only the
+    // batches those rows needed; a row limit should cost no more than that.
+    const fetchesWhenConsumerStops = fetches.mock.calls.length;
+    fetches.mockClear();
+
+    const limitedRows = await readAll(
+      connection.runSQLStream(MANY_BATCHES, {rowLimit: 10})
+    );
+
+    expect(limitedRows).toEqual(consumerRows);
+    expect(fetches.mock.calls.length).toBeLessThanOrEqual(
+      fetchesWhenConsumerStops
+    );
+  });
+
+  it('removes its abort listener after the stream is read to the end', async () => {
+    const controller = new AbortController();
+
+    const rows = await readAll(
+      connection.runSQLStream('SELECT range AS i FROM range(3)', {
+        abortSignal: controller.signal,
+      })
+    );
+
+    expect(rows).toEqual([{i: 0}, {i: 1}, {i: 2}]);
+    expect(abortListenerCount(controller.signal)).toBe(0);
+  });
+
+  it('removes its abort listener when the consumer stops early', async () => {
+    const controller = new AbortController();
+
+    const rows: QueryRecord[] = [];
+    for await (const row of connection.runSQLStream(
+      'SELECT range AS i FROM range(3)',
+      {abortSignal: controller.signal}
+    )) {
+      rows.push(row);
+      break;
+    }
+
+    expect(rows).toEqual([{i: 0}]);
+    expect(abortListenerCount(controller.signal)).toBe(0);
+  });
+
+  it('removes its abort listener when the query fails', async () => {
+    const controller = new AbortController();
+
+    await expect(
+      readAll(
+        connection.runSQLStream('SELECT * FROM no_such_table', {
+          abortSignal: controller.signal,
+        })
+      )
+    ).rejects.toThrow(/no_such_table/);
+
+    expect(abortListenerCount(controller.signal)).toBe(0);
+  });
+
+  it('removes its abort listeners when a statement before the last one fails', async () => {
+    const controller = new AbortController();
+
+    await expect(
+      readAll(
+        connection.runSQLStream(
+          'SELECT * FROM no_such_table\n-- hack: split on this\nSELECT 1 AS one',
+          {abortSignal: controller.signal}
+        )
+      )
+    ).rejects.toThrow(/no_such_table/);
+
+    expect(abortListenerCount(controller.signal)).toBe(0);
+  });
+
+  it('removes its abort listener when the consumer throws', async () => {
+    const controller = new AbortController();
+    const consumeAndThrow = async () => {
+      for await (const row of connection.runSQLStream(
+        'SELECT range AS i FROM range(3)',
+        {abortSignal: controller.signal}
+      )) {
+        throw new Error(`consumer rejected row ${JSON.stringify(row)}`);
+      }
+    };
+
+    await expect(consumeAndThrow()).rejects.toThrow(
+      'consumer rejected row {"i":0}'
+    );
+
+    expect(abortListenerCount(controller.signal)).toBe(0);
+  });
+
+  it('does not cancel a later query started without a signal when an earlier stopped stream is aborted', async () => {
+    const earlier = new AbortController();
+    const earlierRows: QueryRecord[] = [];
+    for await (const row of connection.runSQLStream(
+      'SELECT range AS i FROM range(3)',
+      {abortSignal: earlier.signal}
+    )) {
+      earlierRows.push(row);
+      break;
+    }
+    expect(earlierRows).toEqual([{i: 0}]);
+
+    // send() polls the worker until the query finishes. The worker handles
+    // requests in order, so any cancel this abort sends reaches it ahead of
+    // the poll, while the later query is pending, whatever the machine speed.
+    const db = openDatabase();
+    const poll = db.pollPendingQuery.bind(db);
+    const polls = jest
+      .spyOn(db, 'pollPendingQuery')
+      .mockImplementationOnce(conn => {
+        earlier.abort();
+        return poll(conn);
+      });
+
+    await expect(readAll(connection.runSQLStream(SLOW_QUERY))).resolves.toEqual(
+      [{m: 59998}]
+    );
+    // Without a poll the abort never fired and the query above proved nothing.
+    expect(polls).toHaveBeenCalled();
   });
 });
 
