@@ -6,6 +6,7 @@
 import type {
   AtomicTypeDef,
   FieldDef,
+  MalloyQueryData,
   SQLSourceDef,
   StructDef,
 } from '@malloydata/malloy';
@@ -159,6 +160,50 @@ describe('Trino connection', () => {
       });
     });
   });
+
+  // Without TRINO_SERVER the connection falls back to localhost:8080, which in
+  // the presto CI job (it runs this file too) is a Presto server.
+  const describeWithTrino = TrinoExecutor.getConnectionOptionsFromEnv('trino')
+    ? describe
+    : describe.skip;
+
+  describeWithTrino('a query that fails after rows have been returned', () => {
+    // Trino stops producing output once about 64MB of it (the default 32MB
+    // task output buffer plus the 32MB exchange buffer) is waiting for the
+    // client. The rows come out in x order with 1000 bytes of padding each,
+    // so the division by zero at x = 128000 cannot run until the client has
+    // been sent pages holding tens of thousands of the rows before it.
+    const failsAtRow128000 = `
+      SELECT
+        x,
+        1 / (x - 128000) AS divided,
+        rpad(CAST(x AS varchar), 1000, '.') AS padding
+      FROM UNNEST(sequence(0, 999)) AS a(i)
+      CROSS JOIN UNNEST(sequence(i * 1000, i * 1000 + 999)) AS b(x)`;
+
+    // Reduces a resolved result to its row count, so that a failure message
+    // does not print every row.
+    async function outcome(query: Promise<MalloyQueryData>): Promise<string> {
+      try {
+        const result = await query;
+        return `resolved with ${result.rows.length} rows`;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    it('rejects with the query error', async () => {
+      expect(await outcome(connection.runSQL(failsAtRow128000))).toMatch(
+        /Division by zero/
+      );
+    });
+
+    it('rejects with the query error when it fails before the rowLimit', async () => {
+      expect(
+        await outcome(connection.runSQL(failsAtRow128000, {rowLimit: 200000}))
+      ).toMatch(/Division by zero/);
+    });
+  });
 });
 
 class SchemaConnection extends TrinoPrestoConnection {
@@ -198,6 +243,43 @@ describe.each(['trino', 'presto'])('%s schema discovery', dialect => {
     );
     expect(runSQL).toHaveBeenCalledTimes(2);
     expect(runSQL).toHaveBeenCalledWith('DESCRIBE malloytest.state_facts', {});
+  });
+});
+
+describe('setupSQL failure', () => {
+  it('runs setup again on the next query after setup fails', async () => {
+    const runSQL = jest
+      .fn<ReturnType<BaseRunner['runSQL']>, [string]>()
+      .mockResolvedValueOnce({
+        rows: [],
+        columns: [],
+        error: 'Schema does not exist: memory.later',
+      })
+      .mockResolvedValueOnce({rows: [], columns: []})
+      .mockResolvedValue({
+        rows: [[1]],
+        columns: [{name: 'v', type: 'integer'}],
+      });
+    const connection = new SchemaConnection(
+      'trino',
+      {runSQL},
+      undefined,
+      'USE memory.later'
+    );
+
+    await expect(connection.runSQL('SELECT 1 AS v')).rejects.toThrow(
+      'Schema does not exist: memory.later'
+    );
+    const retried = await connection.runSQL('SELECT 1 AS v').then(
+      result => result.rows,
+      (error: unknown) => error
+    );
+    expect(runSQL.mock.calls.map(([sql]) => sql)).toEqual([
+      'USE memory.later',
+      'USE memory.later',
+      'SELECT 1 AS v',
+    ]);
+    expect(retried).toEqual([{v: 1}]);
   });
 });
 

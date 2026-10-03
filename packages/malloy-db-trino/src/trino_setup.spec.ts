@@ -16,7 +16,7 @@ describe('setupSQL', () => {
   const uid = crypto.randomBytes(4).toString('hex');
   const connections: TrinoConnection[] = [];
 
-  function makeConn(name: string, setupSQL: string): TrinoConnection {
+  function makeConn(name: string, setupSQL?: string): TrinoConnection {
     const conn = new TrinoConnection(name, undefined, {...config, setupSQL});
     connections.push(conn);
     return conn;
@@ -71,5 +71,27 @@ describe('setupSQL', () => {
     expect(result.rows.length).toBe(1);
     // cleanup
     await conn.runSQL(`DROP SCHEMA IF EXISTS memory.${schema}`);
+  });
+
+  it('runs setup again on the next query after setup fails', async () => {
+    const schema = `setup_retry_${uid}`;
+    const conn = makeConn('trino', `USE memory.${schema}`);
+    await expect(conn.runSQL('SELECT 1')).rejects.toThrow(
+      `Schema does not exist: memory.${schema}`
+    );
+
+    const admin = makeConn('trino');
+    await admin.runSQL(`CREATE SCHEMA memory.${schema}`);
+    try {
+      await admin.runSQL(
+        `CREATE TABLE memory.${schema}.marker AS SELECT 42 AS v`
+      );
+      // The unqualified name resolves only if the USE has run again.
+      const result = await conn.runSQL('SELECT v FROM marker');
+      expect(result.rows).toEqual([{v: 42}]);
+    } finally {
+      await admin.runSQL(`DROP TABLE IF EXISTS memory.${schema}.marker`);
+      await admin.runSQL(`DROP SCHEMA IF EXISTS memory.${schema}`);
+    }
   });
 });
