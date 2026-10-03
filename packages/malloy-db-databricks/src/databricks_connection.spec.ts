@@ -68,6 +68,50 @@ describe('basic connectivity', () => {
   });
 });
 
+describe('session setup', () => {
+  it('fails every query while USE SCHEMA fails, instead of running one on the half-configured session', async () => {
+    const conn = new DatabricksConnection('databricks', {
+      host,
+      path,
+      token,
+      defaultCatalog,
+      defaultSchema: 'malloy_no_such_schema',
+    });
+    try {
+      await expect(conn.runSQL('SELECT 1 AS v')).rejects.toThrow(
+        'SCHEMA_NOT_FOUND'
+      );
+      await expect(
+        conn.runSQL('SELECT current_schema() AS sch')
+      ).rejects.toThrow('SCHEMA_NOT_FOUND');
+    } finally {
+      await conn.close();
+    }
+  });
+
+  it('connects again after a rejected token, instead of returning the cached error to the next query', async () => {
+    const conn = new DatabricksConnection('databricks', {
+      host,
+      path,
+      token: 'malloy-invalid-token',
+      defaultCatalog,
+    });
+    try {
+      await expect(conn.runSQL('SELECT 1 AS v')).rejects.toThrow(
+        'bad HTTP status code'
+      );
+      // A token that works stands in for an auth fault that has cleared.
+      conn.config.token = token;
+      await expect(conn.runSQL('SELECT 1 AS v')).resolves.toEqual({
+        rows: [{v: 1}],
+        totalRows: 1,
+      });
+    } finally {
+      await conn.close();
+    }
+  });
+});
+
 describe('schema recognition — atomic types', () => {
   it.each([
     ['INT', 'integer'],
