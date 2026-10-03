@@ -8,6 +8,7 @@ import {
   PostgresConnection,
 } from './postgres_connection';
 import crypto from 'crypto';
+import {Client} from 'pg';
 import type {SQLSourceDef} from '@malloydata/malloy';
 import * as malloy from '@malloydata/malloy';
 import {wrapTestModel} from '@malloydata/malloy/test';
@@ -283,6 +284,20 @@ describe('connection cleanup on query failure', () => {
     adminSQL(
       `SELECT count(pg_terminate_backend(pid))::integer AS n FROM pg_stat_activity WHERE application_name = '${appName}'`
     );
+  // Reads a value until it satisfies `done` or ten seconds pass, and returns the
+  // last value read, so the caller's assertion reports what it saw.
+  const pollFor = async <T>(
+    read: () => T | Promise<T>,
+    done: (value: T) => boolean
+  ): Promise<T> => {
+    const deadline = Date.now() + 10000;
+    let value = await read();
+    while (!done(value) && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      value = await read();
+    }
+    return value;
+  };
 
   const manyRows =
     'SELECT row_to_json(t) AS row FROM (SELECT generate_series(1, 100000) AS n) t';
@@ -404,6 +419,29 @@ describe('connection cleanup on query failure', () => {
   const slowRows =
     'SELECT row_to_json(t) AS row FROM (SELECT n, pg_sleep(0.01) AS s FROM generate_series(1, 1000) AS n) t';
 
+  // An exclusive advisory lock held by a session of its own. The random key
+  // keeps concurrent runs from waiting on each other's locks.
+  const advisoryLock = () => {
+    const holder = new Client({
+      connectionString: taggedConnectionString(newAppName('leak_test_locker')),
+    });
+    const key = crypto.randomInt(1, 2 ** 31);
+    return {
+      key,
+      acquire: async () => {
+        await holder.connect();
+        await holder.query('SELECT pg_advisory_lock($1)', [key]);
+      },
+      release: () => holder.end(),
+    };
+  };
+  // Rows past the first 100-row batch wait on the lock. Reading a stream's
+  // first row sends the fetch for its second batch, so a stream stopped after
+  // one row leaves a fetch on the server that cannot finish, and a session
+  // that cannot end, until the lock is released.
+  const blockedAfterFirstBatch = (lockKey: number) =>
+    `SELECT row_to_json(t) AS row FROM (SELECT n, CASE WHEN n > 100 THEN pg_advisory_xact_lock_shared(${lockKey})::text END AS w FROM generate_series(1, 1000) AS n) t`;
+
   // Reads until the stream ends, rejects, or goes five seconds without a row.
   const readToOutcome = async (
     rows: AsyncIterator<unknown>
@@ -426,21 +464,22 @@ describe('connection cleanup on query failure', () => {
     }
   };
 
+  const newConnection = (pooled: boolean, appName: string) => {
+    const config = {
+      name: 'postgres',
+      connectionString: taggedConnectionString(appName),
+    };
+    return pooled
+      ? new PooledPostgresConnection(config)
+      : new PostgresConnection(config);
+  };
+
   for (const pooled of [false, true]) {
     const kind = pooled ? 'pooled' : 'unpooled';
-    const newConnection = (appName: string) => {
-      const config = {
-        name: 'postgres',
-        connectionString: taggedConnectionString(appName),
-      };
-      return pooled
-        ? new PooledPostgresConnection(config)
-        : new PostgresConnection(config);
-    };
 
     it(`fails the next read of a stream whose session was dropped between reads (${kind})`, async () => {
       const appName = newAppName(`leak_test_dropped_paused_${kind}`);
-      const connection = newConnection(appName);
+      const connection = newConnection(pooled, appName);
       let outcome: 'ended' | 'stalled' | Error = 'stalled';
       try {
         const rows = connection.runSQLStream(manyRows)[Symbol.asyncIterator]();
@@ -466,7 +505,7 @@ describe('connection cleanup on query failure', () => {
 
     it(`fails a stream read that is waiting when its session is dropped (${kind})`, async () => {
       const appName = newAppName(`leak_test_dropped_reading_${kind}`);
-      const connection = newConnection(appName);
+      const connection = newConnection(pooled, appName);
       let outcome: 'ended' | 'stalled' | Error = 'stalled';
       try {
         const rows = connection.runSQLStream(slowRows)[Symbol.asyncIterator]();
@@ -568,6 +607,106 @@ describe('connection cleanup on query failure', () => {
     });
   }
 
+  for (const useRowLimit of [false, true]) {
+    const stop = useRowLimit ? 'rowLimit' : 'break';
+    it(`reuses the client of a stream stopped early once its close completes (pooled, ${stop})`, async () => {
+      const connection = new PooledPostgresConnection({
+        name: 'postgres',
+        connectionString: taggedConnectionString(
+          newAppName('leak_test_stopped_reuse')
+        ),
+      });
+      try {
+        const pool = await connection.getPool();
+        let connects = 0;
+        pool.on('connect', () => {
+          connects += 1;
+        });
+        for (let i = 0; i < 5; i++) {
+          let read = 0;
+          for await (const _row of connection.runSQLStream(
+            manyRows,
+            useRowLimit ? {rowLimit: 150} : {}
+          )) {
+            read += 1;
+            if (!useRowLimit && read === 150) {
+              break;
+            }
+          }
+          expect(read).toBe(150);
+          // A client still finishing the stopped stream's close is not back
+          // in the pool yet. Without the wait, the next stream would open a
+          // second connection only because this one was still on its way back.
+          expect(
+            await pollFor(
+              () => pool.totalCount - pool.idleCount,
+              n => n === 0
+            )
+          ).toBe(0);
+        }
+        const {rows} = await connection.runSQL(
+          'SELECT row_to_json(t) AS row FROM (SELECT 42 AS v) t'
+        );
+        expect(rows).toEqual([{v: 42}]);
+        expect(connects).toBe(1);
+      } finally {
+        await connection.close();
+      }
+    });
+  }
+
+  // PooledPostgresConnection leaves pg-pool's max at its default.
+  const poolMax = 10;
+
+  it("keeps the server's sessions within the pool's max while stopped streams finish their in-flight fetch (pooled)", async () => {
+    const appName = newAppName('leak_test_sessions_over_max');
+    const connection = new PooledPostgresConnection({
+      name: 'postgres',
+      connectionString: taggedConnectionString(appName),
+    });
+    // Holding the lock keeps every stopped stream's session busy on the
+    // server, so the most sessions the pool can leave behind are all still
+    // there to count.
+    const lock = advisoryLock();
+    const failures: unknown[] = [];
+    let streams: Promise<void>[] = [];
+    try {
+      await lock.acquire();
+      const pool = await connection.getPool();
+      let stopped = 0;
+      streams = Array.from({length: poolMax + 2}, async () => {
+        try {
+          for await (const _row of connection.runSQLStream(
+            blockedAfterFirstBatch(lock.key)
+          )) {
+            stopped += 1;
+            break;
+          }
+        } catch (e) {
+          failures.push(e);
+        }
+      });
+      // While the lock is held, no stream can get further than stopping or
+      // waiting for a pool slot.
+      const progress = await pollFor(
+        () => ({stopped, waiting: pool.waitingCount}),
+        p => failures.length > 0 || p.stopped + p.waiting === streams.length
+      );
+      expect(failures).toEqual([]);
+      expect(progress.stopped + progress.waiting).toBe(streams.length);
+      expect(await countSessionsByAppName(appName)).toBeLessThanOrEqual(
+        poolMax
+      );
+    } finally {
+      // Releasing the lock lets every blocked fetch, and so every stream,
+      // finish.
+      await lock.release();
+      await Promise.all(streams);
+      await connection.close();
+    }
+    expect(failures).toEqual([]);
+  });
+
   it('ends a stream at rowLimit without reading rows past it (pooled)', async () => {
     const connection = new PooledPostgresConnection({
       name: 'postgres',
@@ -637,6 +776,220 @@ describe('connection cleanup on query failure', () => {
       expect((await connection.runSQL(one)).rows).toEqual([{v: 1}]);
     } finally {
       await connection.close();
+    }
+  });
+
+  describe('abortSignal', () => {
+    // The first row waits on a 60 second sleep, so a query that stops within
+    // a few seconds of its abort did not wait for the server to finish.
+    const sleepsBeforeFirstRow =
+      'WITH s AS MATERIALIZED (SELECT pg_sleep(60)) SELECT row_to_json(t) AS row FROM (SELECT n FROM s, generate_series(1, 10) AS n) t';
+    const tenRows =
+      'SELECT row_to_json(t) AS row FROM (SELECT generate_series(1, 10) AS n) t';
+    const abortDeadlineMs = 5000;
+
+    const countSleepingSessions = (appName: string) =>
+      adminSQL(
+        `SELECT count(*)::integer AS n FROM pg_stat_activity WHERE application_name = '${appName}' AND wait_event = 'PgSleep'`
+      );
+    const countActiveSessions = (appName: string) =>
+      adminSQL(
+        `SELECT count(*)::integer AS n FROM pg_stat_activity WHERE application_name = '${appName}' AND state = 'active'`
+      );
+
+    // Settles as soon as the operation does, so a rejection is handled from
+    // the moment the operation starts rather than when a test gets to it.
+    const settled = (op: Promise<unknown>): Promise<'returned' | 'threw'> =>
+      op.then(
+        (): 'returned' => 'returned',
+        (): 'threw' => 'threw'
+      );
+    const settledWithin = async (
+      op: Promise<'returned' | 'threw'>,
+      ms: number
+    ): Promise<'returned' | 'threw' | 'still running'> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const outcome = await Promise.race([
+        op,
+        new Promise<'still running'>(resolve => {
+          timer = setTimeout(() => resolve('still running'), ms);
+        }),
+      ]);
+      clearTimeout(timer);
+      return outcome;
+    };
+
+    for (const pooled of [false, true]) {
+      const kind = pooled ? 'pooled' : 'unpooled';
+
+      it(`stops a stream aborted before its first row, and its query on the server (${kind})`, async () => {
+        const appName = newAppName(`abort_test_stream_${kind}`);
+        const connection = newConnection(pooled, appName);
+        const controller = new AbortController();
+        const rows: unknown[] = [];
+        const reading = settled(
+          (async () => {
+            for await (const row of connection.runSQLStream(
+              sleepsBeforeFirstRow,
+              {abortSignal: controller.signal}
+            )) {
+              rows.push(row);
+            }
+          })()
+        );
+        try {
+          // Abort once the server is running the query, not before it starts.
+          expect(
+            await pollFor(
+              () => countSleepingSessions(appName),
+              n => n === 1
+            )
+          ).toBe(1);
+          controller.abort();
+          const outcome = await settledWithin(reading, abortDeadlineMs);
+          if (outcome === 'still running') {
+            throw new Error(
+              `Expected the stream to stop within ${abortDeadlineMs} ms of its abort, but it was still waiting on the server`
+            );
+          }
+          expect(rows).toEqual([]);
+          expect(
+            await pollFor(
+              () => countActiveSessions(appName),
+              n => n === 0
+            )
+          ).toBe(0);
+        } finally {
+          // Ends a query the abort left running, so cleanup does not wait out
+          // the sleep.
+          await terminateSessionsByAppName(appName);
+          await reading;
+          await connection.close();
+        }
+      });
+
+      it(`yields no rows from a stream whose abortSignal is already aborted (${kind})`, async () => {
+        const connection = newConnection(
+          pooled,
+          newAppName(`abort_test_pre_${kind}`)
+        );
+        const controller = new AbortController();
+        controller.abort();
+        const rows: unknown[] = [];
+        try {
+          // Ending and throwing are both a stop; what matters is that no row
+          // arrives.
+          await settled(
+            (async () => {
+              for await (const row of connection.runSQLStream(tenRows, {
+                abortSignal: controller.signal,
+              })) {
+                rows.push(row);
+              }
+            })()
+          );
+          expect(rows).toEqual([]);
+        } finally {
+          await connection.close();
+        }
+      });
+
+      it(`stops the query on the server when a stream is aborted between rows (${kind})`, async () => {
+        const appName = newAppName(`abort_test_between_rows_${kind}`);
+        const connection = newConnection(pooled, appName);
+        const lock = advisoryLock();
+        const controller = new AbortController();
+        let read = 0;
+        let reading: Promise<'returned' | 'threw'> | undefined;
+        try {
+          await lock.acquire();
+          // The fetch for the second batch is on the server, waiting on the
+          // lock, by the time the first row arrives, so only a cancel can
+          // stop it before the lock is released.
+          reading = settled(
+            (async () => {
+              for await (const _row of connection.runSQLStream(
+                blockedAfterFirstBatch(lock.key),
+                {abortSignal: controller.signal}
+              )) {
+                read += 1;
+                controller.abort();
+              }
+            })()
+          );
+          const outcome = await settledWithin(reading, abortDeadlineMs);
+          if (outcome === 'still running') {
+            throw new Error(
+              `Expected the stream to stop within ${abortDeadlineMs} ms of its abort, but it was still waiting on the server`
+            );
+          }
+          expect(read).toBe(1);
+          expect(
+            await pollFor(
+              () => countActiveSessions(appName),
+              n => n === 0
+            )
+          ).toBe(0);
+        } finally {
+          await lock.release();
+          await reading;
+          await connection.close();
+        }
+      });
+
+      it(`stops runSQL when its abortSignal fires, and its query on the server (${kind})`, async () => {
+        const appName = newAppName(`abort_test_runsql_${kind}`);
+        const connection = newConnection(pooled, appName);
+        const controller = new AbortController();
+        const running = settled(
+          connection.runSQL(sleepsBeforeFirstRow, {
+            abortSignal: controller.signal,
+          })
+        );
+        try {
+          expect(
+            await pollFor(
+              () => countSleepingSessions(appName),
+              n => n === 1
+            )
+          ).toBe(1);
+          controller.abort();
+          const outcome = await settledWithin(running, abortDeadlineMs);
+          if (outcome !== 'threw') {
+            throw new Error(
+              `Expected runSQL to reject within ${abortDeadlineMs} ms of its abort, but it ${outcome === 'returned' ? 'returned a result' : 'was still waiting on the server'}`
+            );
+          }
+          expect(
+            await pollFor(
+              () => countActiveSessions(appName),
+              n => n === 0
+            )
+          ).toBe(0);
+        } finally {
+          // Ends a query the abort left running, so cleanup does not wait out
+          // the sleep.
+          await terminateSessionsByAppName(appName);
+          await running;
+          await connection.close();
+        }
+      });
+
+      it(`rejects runSQL whose abortSignal is already aborted (${kind})`, async () => {
+        const connection = newConnection(
+          pooled,
+          newAppName(`abort_test_pre_runsql_${kind}`)
+        );
+        const controller = new AbortController();
+        controller.abort();
+        try {
+          await expect(
+            connection.runSQL(tenRows, {abortSignal: controller.signal})
+          ).rejects.toThrow();
+        } finally {
+          await connection.close();
+        }
+      });
     }
   });
 });
