@@ -3,7 +3,13 @@
  * SPDX-License-Identifier: MIT
  */
 
-import type {BigQueryOptions} from '@google-cloud/bigquery';
+import type {
+  BigQueryOptions,
+  CancelResponse,
+  JobResponse,
+} from '@google-cloud/bigquery';
+import {BigQuery, Job} from '@google-cloud/bigquery';
+import {ApiError} from '@google-cloud/common';
 import {BigQueryConnection} from './bigquery_connection';
 
 // The callback overload yields (err, rows, nextQuery, apiResponse).
@@ -106,6 +112,56 @@ describe('BigQueryConnection.runSQL (hermetic, stubbed job)', () => {
     expect(data.rows).toEqual([{n: 1}, {n: 2}]);
     expect(data.totalRows).toBe(2);
     expect(getQueryResults).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('BigQueryConnection.runSQL when the caller aborts', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('rejects with the abort error and absorbs a failed job cancel instead of leaving it unhandled', async () => {
+    // A real SDK Job with the two calls this path makes stubbed, so no request
+    // leaves the process.
+    const job = new Job(new BigQuery({projectId: 'test-project'}), 'job-1');
+    // A poll that never answers, so the abort lands while the job is running.
+    const pollInFlight = new Promise<void>(resolve => {
+      jest.spyOn(job, 'getQueryResults').mockImplementation(() => resolve());
+    });
+    // The jobs.cancel request itself fails, as it does on a dropped
+    // connection or a 5xx from the API.
+    const cancel = jest
+      .spyOn(job, 'cancel')
+      .mockImplementation((): Promise<CancelResponse> => {
+        const error = new ApiError('Bad Gateway');
+        error.code = 502;
+        return Promise.reject(error);
+      });
+    // Stubbed on the prototype: the connection builds its own SDK client and
+    // keeps it private.
+    const createQueryJob = async (): Promise<JobResponse> => [job, {}];
+    jest
+      .spyOn(BigQuery.prototype, 'createQueryJob')
+      .mockImplementation(createQueryJob);
+
+    const conn = new BigQueryConnection({
+      name: 'bq',
+      projectId: 'test-project',
+    });
+    const controller = new AbortController();
+    const run = conn.runSQL('SELECT 1', {abortSignal: controller.signal});
+    await pollInFlight;
+    controller.abort();
+
+    await expect(run).rejects.toThrow(
+      'BigQuery getQueryResults was aborted before the query completed.'
+    );
+    expect(cancel).toHaveBeenCalledTimes(1);
+    // Node reports a rejection that nothing handled only after the microtask
+    // queue drains, and Jest fails whichever test is running when it does.
+    // One turn of the event loop makes that report land inside this test
+    // rather than after the file has finished.
+    await new Promise(resolve => setImmediate(resolve));
   });
 });
 
