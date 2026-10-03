@@ -36,7 +36,7 @@ import {
 import {BaseConnection} from '@malloydata/malloy/connection';
 
 import {Client, Pool} from 'pg';
-import type {ClientBase, ClientConfig, FieldDef} from 'pg';
+import type {ClientBase, ClientConfig, FieldDef, PoolClient} from 'pg';
 import QueryStream from 'pg-query-stream';
 
 /**
@@ -149,15 +149,62 @@ function closeClient(client: Client): void {
 // Fails a row stream when the connection under it drops. pg-query-stream 4.2.3
 // tears a failed stream down by closing its cursor, which waits for a server
 // reply that a dead connection never sends, so without this the stream neither
-// ends nor errors. Returns a function that detaches the listener; call it before
-// the client is closed or released.
+// ends nor errors. Call detach() before the client is closed or released;
+// dropped() says whether the connection has dropped.
 function failStreamOnClientError(
   client: ClientBase,
   stream: QueryStream
-): () => void {
-  const onError = (err: Error) => stream.emit('error', err);
+): {detach: () => void; dropped: () => boolean} {
+  let dropped = false;
+  const onError = (err: Error) => {
+    dropped = true;
+    stream.emit('error', err);
+  };
   client.on('error', onError);
-  return () => client.removeListener('error', onError);
+  return {
+    detach: () => client.removeListener('error', onError),
+    dropped: () => dropped,
+  };
+}
+
+// Returns the client of a pooled row stream that stopped before its end. The
+// stream's close waits for the server to finish the batch in flight, so the
+// client stays checked out until then rather than going back mid-query, and
+// the server never runs more sessions than the pool holds. If that batch
+// failed, pg-cursor 2.7.3 has sent a second Sync whose extra ReadyForQuery
+// would complete the next borrower's query early, so the client is discarded
+// instead; so is one whose connection drops before the close completes.
+function releaseAfterClose(
+  client: PoolClient,
+  stream: QueryStream,
+  batchFailed: () => boolean
+): void {
+  let released = false;
+  const release = (err?: Error) => {
+    if (released) {
+      return;
+    }
+    released = true;
+    client.removeListener('error', onDrop);
+    client.removeListener('end', onDrop);
+    stream.removeListener('close', onClose);
+    client.release(err);
+  };
+  const onDrop = () =>
+    release(new Error('connection dropped before its row stream closed'));
+  const onClose = () =>
+    release(
+      batchFailed()
+        ? new Error('row stream failed while it was closing')
+        : undefined
+    );
+  client.on('error', onDrop);
+  client.on('end', onDrop);
+  if (stream.closed) {
+    onClose();
+  } else {
+    stream.once('close', onClose);
+  }
 }
 
 /**
@@ -576,7 +623,7 @@ export class PostgresConnection
       await this.withTlsHint(() => client.connect());
       await this.connectionSetup(client);
       const rowStream = client.query(query);
-      detach = failStreamOnClientError(client, rowStream);
+      detach = failStreamOnClientError(client, rowStream).detach;
       let index = 0;
       for await (const row of rowStream) {
         yield row.row as QueryRecord;
@@ -714,8 +761,16 @@ export class PooledPostgresConnection
     // pg-pool takes its own 'error' listener off a client while it is checked
     // out, so this listener is also what keeps a dropped connection from
     // surfacing as an uncaught exception.
-    const detach = failStreamOnClientError(client, query);
+    const {detach, dropped} = failStreamOnClientError(client, query);
+    // pg-cursor 2.7.3 emits a batch's error on the cursor only when something
+    // listens for it; releaseAfterClose needs to know about one that arrives
+    // while the stream is closing.
+    let batchFailed = false;
+    query.cursor.on('error', () => {
+      batchFailed = true;
+    });
     let drained = false;
+    let threw = false;
     try {
       const resultStream: QueryStream = client.query(query);
       for await (const row of resultStream) {
@@ -726,29 +781,32 @@ export class PooledPostgresConnection
           abortSignal?.aborted
         ) {
           // The rows of a result that fits in one batch arrive with its end.
-          // Once pg-cursor 2.7.3 has that end its state is 'done': no fetch is
-          // in flight and closing it sends nothing, so the client can be reused.
+          // Once pg-cursor 2.7.3 has that end its state is 'done': nothing is
+          // in flight, so the client can go back to the pool at once.
           drained = query.cursor.state === 'done';
           query.destroy();
           return;
         }
       }
       drained = true;
+    } catch (e) {
+      threw = true;
+      throw e;
     } finally {
       // release(), not end(): this client came from pool.connect(), so it goes
       // back to the pool rather than closing its session. Nothing else returns
       // it on a throw or an early consumer exit, and a client that is never
-      // released holds one of the pool's `max` slots for good.
-      //
-      // A stream that stopped before its end can leave a fetch in flight on
-      // the client, so it is released with an error, which makes the pool
-      // discard it instead of handing the next caller a client mid-query.
+      // released holds one of the pool's `max` slots for good. A client whose
+      // stream failed is released with an error, which makes the pool discard
+      // it; one whose stream stopped early goes back once its close completes.
       detach();
-      client.release(
-        drained
-          ? undefined
-          : new Error('row stream stopped before reading all its rows')
-      );
+      if (drained) {
+        client.release();
+      } else if (threw || dropped()) {
+        client.release(new Error('row stream failed'));
+      } else {
+        releaseAfterClose(client, query, () => batchFailed);
+      }
     }
   }
 

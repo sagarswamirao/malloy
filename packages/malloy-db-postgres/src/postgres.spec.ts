@@ -279,6 +279,18 @@ describe('connection cleanup on query failure', () => {
     }
     expect(count).toBe(0);
   };
+  // A pooled stream stopped early returns its client once the stream's close
+  // completes, so poll until nothing is checked out rather than checking once.
+  const expectAllClientsIdle = async (pool: {
+    totalCount: number;
+    idleCount: number;
+  }) => {
+    const deadline = Date.now() + 5000;
+    while (pool.totalCount !== pool.idleCount && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(pool.totalCount - pool.idleCount).toBe(0);
+  };
   const terminateSessionsByAppName = (appName: string) =>
     adminSQL(
       `SELECT count(pg_terminate_backend(pid))::integer AS n FROM pg_stat_activity WHERE application_name = '${appName}'`
@@ -513,9 +525,8 @@ describe('connection cleanup on query failure', () => {
       for await (const _row of connection.runSQLStream(manyRows)) {
         break;
       }
-      const pool = await connection.getPool();
       // Checked-out clients: anything a stream failed to release.
-      expect(pool.totalCount - pool.idleCount).toBe(0);
+      await expectAllClientsIdle(await connection.getPool());
     } finally {
       // pool.end() waits for every checked-out client, so a leaked one would
       // turn the failed assertion above into a hang. Skip the close in that
@@ -542,6 +553,11 @@ describe('connection cleanup on query failure', () => {
         ),
       });
       try {
+        const pool = await connection.getPool();
+        let removed = 0;
+        pool.on('remove', () => {
+          removed += 1;
+        });
         let read = 0;
         for await (const _row of connection.runSQLStream(
           failsInSecondBatch,
@@ -553,6 +569,10 @@ describe('connection cleanup on query failure', () => {
           }
         }
         expect(read).toBe(5);
+        // The batch in flight failed while the stream was closing, so its
+        // client is discarded rather than returned.
+        await expectAllClientsIdle(pool);
+        expect(removed).toBe(1);
         for (const v of [42, 43, 44]) {
           const {rows} = await connection.runSQL(
             `SELECT row_to_json(t) AS row FROM (SELECT ${v} AS v) t`
@@ -567,6 +587,72 @@ describe('connection cleanup on query failure', () => {
       }
     });
   }
+
+  for (const useRowLimit of [false, true]) {
+    const stop = useRowLimit ? 'rowLimit' : 'break';
+    it(`reuses the client of a stream stopped early once its close completes (pooled, ${stop})`, async () => {
+      const connection = new PooledPostgresConnection({
+        name: 'postgres',
+        connectionString: taggedConnectionString(
+          newAppName('leak_test_stopped_reuse')
+        ),
+      });
+      try {
+        const pool = await connection.getPool();
+        let connects = 0;
+        pool.on('connect', () => {
+          connects += 1;
+        });
+        for (let i = 0; i < 5; i++) {
+          let read = 0;
+          for await (const _row of connection.runSQLStream(
+            manyRows,
+            useRowLimit ? {rowLimit: 150} : {}
+          )) {
+            read += 1;
+            if (!useRowLimit && read === 150) {
+              break;
+            }
+          }
+          expect(read).toBe(150);
+          await expectAllClientsIdle(pool);
+        }
+        const {rows} = await connection.runSQL(
+          'SELECT row_to_json(t) AS row FROM (SELECT 42 AS v) t'
+        );
+        expect(rows).toEqual([{v: 42}]);
+        expect(connects).toBe(1);
+      } finally {
+        await connection.close();
+      }
+    });
+  }
+
+  it("discards a stopped stream's client whose session drops before the close completes (pooled)", async () => {
+    const appName = newAppName('leak_test_drop_while_closing');
+    const connection = new PooledPostgresConnection({
+      name: 'postgres',
+      connectionString: taggedConnectionString(appName),
+    });
+    try {
+      // The second 100-row batch takes about a second, so the close is still
+      // waiting on it when the session is terminated.
+      for await (const _row of connection.runSQLStream(slowRows)) {
+        break;
+      }
+      expect(await terminateSessionsByAppName(appName)).toBe(1);
+      await expectAllClientsIdle(await connection.getPool());
+      const {rows} = await connection.runSQL(
+        'SELECT row_to_json(t) AS row FROM (SELECT 42 AS v) t'
+      );
+      expect(rows).toEqual([{v: 42}]);
+    } finally {
+      const pool = await connection.getPool();
+      if (pool.totalCount === pool.idleCount) {
+        await connection.close();
+      }
+    }
+  });
 
   it('ends a stream at rowLimit without reading rows past it (pooled)', async () => {
     const connection = new PooledPostgresConnection({
