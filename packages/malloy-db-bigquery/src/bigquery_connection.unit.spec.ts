@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: MIT
  */
 
+import {once} from 'events';
 import type {BigQueryOptions} from '@google-cloud/bigquery';
+import {paginator, ResourceStream} from '@google-cloud/paginator';
+import type {ParsedArguments} from '@google-cloud/paginator';
 import {BigQueryConnection} from './bigquery_connection';
 
 // The callback overload yields (err, rows, nextQuery, apiResponse).
@@ -164,5 +167,105 @@ describe('BigQueryConnection authClient', () => {
         rawConfigData: {is: 'bigquery'},
       }).getDigest()
     );
+  });
+});
+
+const PAGES = 10;
+const ROWS_PER_PAGE = 100;
+const CLOSE_DEADLINE_MS = 5000;
+
+interface PagedRow {
+  i: number;
+}
+
+// The paginator's request function answers through a callback taking
+// (err, rows, nextQuery); a null nextQuery marks the last page.
+type PageCallback = (
+  err: Error | null,
+  rows: PagedRow[],
+  nextQuery: {pageToken: number} | null
+) => void;
+
+/**
+ * A query result BigQuery hands back a page at a time. createQueryStream stays
+ * the SDK's own, and so does the paginator's ResourceStream it returns; only
+ * the request the stream makes for each page is answered here. In production
+ * that request is BigQuery.queryAsStream_, which fetches the page with
+ * getQueryResults. Each page arrives a macrotask after it is requested, the
+ * way a page arrives off the network.
+ */
+class PagedResult {
+  pagesRequested = 0;
+  private stream: ResourceStream<PagedRow> | undefined;
+
+  open(parsedArguments: ParsedArguments): ResourceStream<PagedRow> {
+    this.stream = new ResourceStream<PagedRow>(parsedArguments, this.servePage);
+    return this.stream;
+  }
+
+  private readonly servePage = (_query: unknown, callback: PageCallback) => {
+    const page = this.pagesRequested++;
+    setImmediate(() => {
+      const rows = Array.from({length: ROWS_PER_PAGE}, (_, k) => ({
+        i: page * ROWS_PER_PAGE + k,
+      }));
+      callback(null, rows, page + 1 < PAGES ? {pageToken: page + 1} : null);
+    });
+  };
+
+  /**
+   * Waits for the query stream to close, which it does either when it is
+   * torn down or after it has read the last page. Waiting for that event,
+   * rather than checking right after the consumer stops, gives a stream that
+   * was not stopped the time to request the rest of the pages.
+   */
+  async closed(): Promise<void> {
+    const stream = this.stream;
+    if (stream === undefined) {
+      throw new Error('runSQLStream never opened a query stream');
+    }
+    if (stream.closed) return;
+    const deadline = AbortSignal.timeout(CLOSE_DEADLINE_MS);
+    try {
+      await once(stream, 'close', {signal: deadline});
+    } catch (error) {
+      if (!deadline.aborted) throw error;
+      throw new Error(
+        `Query stream still open ${CLOSE_DEADLINE_MS}ms after the consumer stopped, having requested ${this.pagesRequested} of ${PAGES} pages`
+      );
+    }
+  }
+}
+
+describe('BigQueryConnection.runSQLStream (hermetic, stubbed pages)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  function pagedResult(): PagedResult {
+    const result = new PagedResult();
+    jest
+      .spyOn(paginator, 'runAsStream_')
+      .mockImplementation(parsedArguments => result.open(parsedArguments));
+    return result;
+  }
+
+  it('stops paging through the result when the consumer breaks out of for await', async () => {
+    const result = pagedResult();
+    const conn = new BigQueryConnection('hermetic');
+    const seen: unknown[] = [];
+    for await (const row of conn.runSQLStream('SELECT i FROM a_large_result')) {
+      seen.push(row);
+      if (seen.length === 2) break;
+    }
+    const pagesAtStop = result.pagesRequested;
+    expect(seen).toEqual([{i: 0}, {i: 1}]);
+
+    await result.closed();
+    // pagesAtStop already counts the second page: the stream asks for the next
+    // page before the consumer has seen a row of the current one, so that
+    // request was in flight before the consumer stopped. A request made after
+    // the stop is paging for a consumer that has gone.
+    expect({
+      pagesRequestedAfterStop: result.pagesRequested - pagesAtStop,
+    }).toEqual({pagesRequestedAfterStop: 0});
   });
 });

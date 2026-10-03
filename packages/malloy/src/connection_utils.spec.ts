@@ -47,16 +47,22 @@ class RowSource extends Readable {
 
 /**
  * Attaches to the source the way the Snowflake and BigQuery executors do, and
- * returns the source's teardown so the generator can stop the source once its
- * consumer stops reading.
+ * gives the generator both of the ways it could stop the source once its
+ * consumer stops reading: the producer returns a teardown that destroys the
+ * source, and it destroys the source when an optional AbortSignal aborts. A
+ * fix can take either shape and these tests hold it to the same behavior. The
+ * signal is an optional fourth parameter so that this producer still matches
+ * the three-callback type toAsyncGenerator declares today.
  */
 function streamFrom(source: RowSource) {
   return (
     onError: (error: Error) => void,
     onData: (row: Row) => void,
-    onEnd: () => void
+    onEnd: () => void,
+    signal?: AbortSignal
   ) => {
     source.on('error', onError).on('data', onData).on('end', onEnd);
+    signal?.addEventListener('abort', () => source.destroy(), {once: true});
     return () => {
       source.destroy();
     };

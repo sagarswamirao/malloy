@@ -185,6 +185,7 @@ const config: Config = {
     {
       ...defaultConfig,
       displayName: 'db-snowflake',
+      testPathIgnorePatterns: connectorUnitIgnored,
       roots: ['<rootDir>/packages/malloy-db-snowflake/'],
     },
     {
